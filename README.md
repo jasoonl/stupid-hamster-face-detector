@@ -1,6 +1,5 @@
 # stupid-hamster-face-detector
 
-"""
 make a face — a live webcam "doodle mirror".
 
 Same idea as the demo it's based on: a green tracking box + a live metrics
@@ -21,4 +20,3 @@ Run:
 Controls:
     c — calibrate (hold a relaxed, neutral face still for ~1 second)
     q — quit
-"""
