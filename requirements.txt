@@ -1,0 +1,8 @@
+# Install with:  pip3 install -r requirements.txt
+#
+# IMPORTANT: you must NOT also have plain `opencv-python` installed at the
+# same time -- it shadows the `cv2.face` landmark module this app needs.
+# If you have it, remove it first:  pip3 uninstall -y opencv-python
+opencv-contrib-python<5
+numpy
+scikit-learn

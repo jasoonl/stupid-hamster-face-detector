@@ -1,0 +1,20 @@
+# --- your own recorded training data (personal, and it grows every run) ---
+# Each person who uses the app builds their own; it shouldn't live in the repo.
+features_user.npz
+
+# --- the face-landmark model (54MB, downloads itself on first run) ---
+# Too big for a normal Git repo and identical for everyone, so it's fetched
+# automatically instead of committed. See expression_engine.py (LBF_MODEL_URL).
+lbfmodel.yaml
+
+# --- old MediaPipe model, no longer used ---
+hand_landmarker.task
+
+# --- Python junk ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
