@@ -1,48 +1,100 @@
 # stupid-hamster-face-detector
 
-make a face -- shows one of your own reference photos ("hamster" faces)
-when your live expression matches it, with a live camera feed + neon-green
-readout on the left and the matched photo on the right.
+# make a face
 
-HOW RECOGNITION WORKS NOW (this is a full rewrite of the old approach):
+A webcam toy that shows one of your own reference photos (your "hamster"
+faces) when your live expression matches it. Make a shocked face → your
+shock photo pops up. Stick your tongue out → your tongue photo. Etc.
 
-The previous version compared raw pixels of a mouth crop against each
-reference photo. Tested against real webcam footage, that failed badly
-(~25% -- it literally could not tell a neutral face from a shocked one),
-for two reasons: (1) it located the mouth as a fixed fraction of the
-OpenCV Haar face box, whose height swings wildly frame to frame, so the
-crop landed on the nose or chin; (2) even perfectly aligned, grayscale
-mouth crops don't discriminate expressions -- they all correlate.
+Live camera + a neon-green readout on the left, the matched photo on the
+right.
 
-This version instead:
-  - tracks 68 facial landmarks with OpenCV's LBF facemark (pure CPU, so
-    it CANNOT trigger the MediaPipe Metal-GPU crash that aborted the old
-    app on macOS -- MediaPipe is gone entirely here),
-  - turns them (+ a mouth-color read + skin coverage around the face for
-    the hand gestures) into a small feature vector,
-  - classifies that vector with a RandomForest trained on real labeled
-    frames. On the reference footage this separated all five expressions
-    (neutral / shock / tongue / huh / shush) at ~94%.
+## How it works
 
-See expression_engine.py for the recognition brain. This file is the
-camera loop, the UI, and the in-app "teach it" data-collection mode.
+Recognition is a small **trained classifier**, not pixel matching:
 
-TEACH IT YOUR FACE (improves accuracy):
-  While it's running, hold an expression and press the number key for it:
-      1 neutral   2 shock   3 tongue   4 huh   5 shush
-  Each press records the current frame as a labeled example and instantly
-  retrains, so it gets better at YOUR face, lighting and camera the more
-  you feed it. Samples are saved (features_user.npz) and reused next run.
+1. **68 facial landmarks** are tracked every frame with OpenCV's LBF
+   facemark (`cv2.face`) — a pure-CPU model, so there's no GPU dependency
+   and nothing to crash.
+2. Those landmarks (plus a color read of the mouth interior and skin
+   coverage in zones around the face, for the hand gestures) become a
+   small **feature vector** describing the expression.
+3. A **RandomForest** classifies that vector into one of five states:
+   `neutral`, `shock`, `tongue`, `huh`, `shush`. It's trained at launch
+   from a shipped dataset of feature numbers plus anything you teach it.
 
-CONTROLS:
-  1..5  record the current frame as neutral/shock/tongue/huh/shush
-  q     quit
+On the reference footage it separates all five expressions at ~91%
+(honest temporal holdout), versus ~25% for the old pixel-matching
+approach it replaced.
 
-SETUP:
-  pip3 uninstall -y opencv-python                 # if you have the plain one
-  pip3 install "opencv-contrib-python<5" numpy scikit-learn
-  python3 app.py            # (add a number, e.g. `python3 app.py 1`, for a second camera)
+## Setup
 
-Put your photos in an "images" folder next to this script, named for the
-pose: shock.jpg, tongue.jpg (or toungue.jpg), huh.jpg, shush.jpg,
-neutral.jpg. The face-landmark model downloads itself once on first run.
+```bash
+# If you have plain opencv-python, remove it first (it shadows cv2.face):
+pip3 uninstall -y opencv-python
+
+pip3 install -r requirements.txt
+python3 app.py
+```
+
+Add a camera index for a second camera, e.g. `python3 app.py 1` (useful
+if an iPhone Continuity Camera grabs index 0 on a Mac).
+
+The face-landmark model (`lbfmodel.yaml`, ~54MB) downloads itself once on
+first run.
+
+## Controls
+
+| key   | action |
+|-------|--------|
+| `1`   | record the current frame as **neutral** |
+| `2`   | record the current frame as **shock** |
+| `3`   | record the current frame as **tongue** |
+| `4`   | record the current frame as **huh** |
+| `5`   | record the current frame as **shush** |
+| `q`   | quit |
+
+## Teach it your face
+
+Hold an expression and press its number key. Each press records that
+frame as a labeled example and **instantly retrains**, so accuracy climbs
+on your face, lighting, and camera the more you feed it. Your samples
+save to `features_user.npz` and are reused every run. To reset your
+teaching, delete that file.
+
+## Your photos
+
+Put your reference photos in an `images/` folder next to `app.py`, named
+for the pose:
+
+```
+images/
+├── neutral.jpg
+├── shock.jpg
+├── tongue.jpg   (or toungue.jpg)
+├── huh.jpg
+└── shush.jpg
+```
+
+`.png`, `.jpg`, `.jpeg`, `.webp` all work; transparent PNGs composite
+correctly.
+
+## Files
+
+| file | what it is |
+|------|-----------|
+| `app.py` | camera loop, UI, the "teach it" keys |
+| `expression_engine.py` | the recognition brain (landmarks → features → classifier) |
+| `features_bootstrap.npz` | starting training data (feature numbers only, no images) so it works out of the box |
+| `test_app.py` | tests (`python3 test_app.py`) |
+| `images/` | your reference photos |
+| `requirements.txt` | dependencies |
+
+`lbfmodel.yaml` (downloaded) and `features_user.npz` (your recordings)
+are git-ignored — they're generated locally, not committed.
+
+## Credits
+
+Facial-landmark model: [LBF 68-point model](https://github.com/kurnianggoro/GSOC2017)
+trained for OpenCV's `cv2.face` facemark. Built with OpenCV, NumPy, and
+scikit-learn.
