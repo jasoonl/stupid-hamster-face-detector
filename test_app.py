@@ -1,14 +1,3 @@
-"""
-Tests for the camera-independent logic in app.py + expression_engine.py.
-No webcam, GUI, or landmark-model download required -- the landmark
-tracker (which needs the one-time model file) is exercised separately at
-runtime, not here. Run:  python3 test_app.py
-
-Covers: feature extraction (shape + invariance), dataset load/append
-round-trip, the classifier train/predict contract, and the UI helpers
-(panel fitting, reaction panel idle/matched, debug overlay, reference-
-image aliasing).
-"""
 import tempfile
 from pathlib import Path
 
@@ -25,9 +14,7 @@ def check(name, cond):
 
 
 def synthetic_landmarks():
-    """A plausible, roughly face-shaped set of 68 (x, y) points so
-    extract_features() has something valid to compute on without a real
-    image/model. Values are arbitrary but geometrically sane."""
+
     pts = np.zeros((68, 2), dtype=np.float32)
     # eyes: 36 (left outer) .. 45 (right outer) -- set a real interocular span
     pts[36] = (200, 300); pts[45] = (360, 300)
@@ -47,12 +34,10 @@ def synthetic_landmarks():
 def main():
     results = []
 
-    # --- engine constants ---
     results.append(check("POSES has the 5 expected expressions",
                          set(E.POSES) == {"neutral", "shock", "tongue", "huh", "shush"}))
     results.append(check("N_FEATURES is a positive int", isinstance(E.N_FEATURES, int) and E.N_FEATURES > 0))
 
-    # --- extract_features: shape + scale invariance ---
     img = np.full((480, 640, 3), (150, 130, 180), dtype=np.uint8)
     lm = synthetic_landmarks()
     box = (180, 240, 200, 200)
@@ -60,14 +45,11 @@ def main():
     results.append(check(f"extract_features returns N_FEATURES ({E.N_FEATURES}) floats",
                          feats.shape == (E.N_FEATURES,) and feats.dtype == np.float32))
 
-    # scaling the whole face 2x (landmarks + box) should barely change the
-    # geometry features, since they're normalized by interocular distance
     feats_2x = E.extract_features(img, lm * 2, tuple(v * 2 for v in box))
     geo = slice(0, 6)
     results.append(check("geometry features are ~scale-invariant (2x face -> ~same values)",
                          np.allclose(feats[geo], feats_2x[geo], atol=0.05)))
 
-    # --- dataset load/append round-trip ---
     with tempfile.TemporaryDirectory() as tmp:
         ds = Path(tmp) / "user.npz"
         Xa = np.random.RandomState(0).rand(3, E.N_FEATURES).astype(np.float32)
@@ -79,7 +61,6 @@ def main():
         results.append(check("load_dataset on a missing path returns empty, no crash",
                              E.load_dataset(Path(tmp) / "nope.npz")[0].shape == (0, E.N_FEATURES)))
 
-    # --- classifier train/predict contract ---
     try:
         from sklearn.ensemble import RandomForestClassifier  # noqa: F401
         have_sklearn = True
@@ -88,7 +69,6 @@ def main():
 
     if have_sklearn:
         rs = np.random.RandomState(1)
-        # two clearly separable clusters -> classifier must recover them
         Xa = np.vstack([rs.rand(20, E.N_FEATURES), rs.rand(20, E.N_FEATURES) + 5.0]).astype(np.float32)
         ya = np.array(["neutral"] * 20 + ["shock"] * 20)
         clf = E.ExpressionClassifier()
@@ -101,10 +81,8 @@ def main():
                              pose_lo == "neutral" and pose_hi == "shock"))
         results.append(check("classifier confidence is a probability in [0,1]",
                              0.0 <= conf_lo <= 1.0 and 0.0 <= conf_hi <= 1.0))
-        # untrained classifier returns (None, 0.0), never crashes
         results.append(check("untrained classifier predict -> (None, 0.0)",
                              E.ExpressionClassifier().predict(feats) == (None, 0.0)))
-        # training refuses degenerate input
         try:
             E.ExpressionClassifier().train(Xa[:1], ya[:1]); ok = False
         except ValueError:
@@ -113,7 +91,6 @@ def main():
     else:
         print("SKIP  classifier tests (scikit-learn not installed)")
 
-    # --- UI: fit_image_to_panel ---
     solid = lambda w, h, c: np.full((h, w, 3), c, dtype=np.uint8)
     out = app.fit_image_to_panel(solid(200, 200, (10, 10, 200)), 400, 250)
     results.append(check("fit_image_to_panel: square into wide panel is padded with PANEL_BG",
@@ -127,7 +104,6 @@ def main():
     results.append(check("fit_image_to_panel: 50% alpha blends toward background",
                          center != (10, 10, 200) and center != app.PANEL_BG))
 
-    # --- UI: reaction panel idle vs matched ---
     idle = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
     app.draw_reaction_panel(idle, None)
     results.append(check("reaction panel idle: plain PANEL_BG background",
@@ -140,7 +116,6 @@ def main():
     results.append(check("reaction panel matched: the photo's own color appears",
                          np.any(np.all(matched == np.array((200, 100, 50), np.uint8), axis=-1))))
 
-    # --- UI: debug overlay draws in neon green, no crash, with/without face ---
     frame = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
     app.draw_debug(frame, (50, 50, 100, 100), "shock", 0.87,
                    {"mouth_open": 0.3, "brow_raise": 0.1, "eye_open": 0.2, "smile": 0.0},
@@ -152,12 +127,10 @@ def main():
     results.append(check("draw_debug: handles no-face / no-stats without crashing",
                          frame2.shape == (app.PANEL_H, app.PANEL_W, 3)))
 
-    # --- stats_from_features maps to a readable dict ---
     s = app.stats_from_features(feats)
     results.append(check("stats_from_features returns the 4 readout keys",
                          set(s.keys()) == {"mouth_open", "brow_raise", "eye_open", "smile"}))
 
-    # --- load_reference_images with aliasing ---
     with tempfile.TemporaryDirectory() as tmp:
         d = Path(tmp)
         cv2.imwrite(str(d / "shock.jpg"), solid(60, 60, (0, 0, 255)))
