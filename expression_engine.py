@@ -1,20 +1,36 @@
+"""
+Recognition engine for "make a face": tracks 68 facial landmarks with
+OpenCV's LBF facemark (pure CPU), turns them plus mouth color and skin
+coverage into a feature vector, and classifies it with a RandomForest
+trained at runtime from the shipped dataset + any samples recorded in-app.
+
+Requires: opencv-contrib-python (for cv2.face), numpy, scikit-learn.
+"""
 from pathlib import Path
 from typing import Optional, List, Tuple
 import numpy as np
 import cv2
 
+
+POSES = ["neutral", "shock", "tongue", "huh", "shush"]
+HAND_POSES = {"huh", "shush"}
+
 LBF_MODEL_URL = "https://raw.githubusercontent.com/kurnianggoro/GSOC2017/master/data/lbfmodel.yaml"
 LBF_MODEL_PATH = Path(__file__).resolve().parent / "lbfmodel.yaml"
 
+# Shipped starter training data (feature numbers only, no images) so the
+# app works out of the box; user recordings accumulate in USER_DATASET.
 BOOTSTRAP_DATASET = Path(__file__).resolve().parent / "features_bootstrap.npz"
-
 USER_DATASET = Path(__file__).resolve().parent / "features_user.npz"
 
-N_FEATURES = 12
+N_FEATURES = 12   # length of extract_features() output; asserted at runtime
 
 
 def _download_with_ssl_fallback(url: str, dest_path: Path) -> None:
-   
+    """Download `url` to `dest_path`. Works around the common macOS
+    python.org "CERTIFICATE_VERIFY_FAILED" issue by falling back to the
+    certifi CA bundle, then to an unverified connection. Raises on total
+    failure."""
     import ssl
     import urllib.error
     import urllib.request
@@ -36,22 +52,23 @@ def _download_with_ssl_fallback(url: str, dest_path: Path) -> None:
     except Exception:
         pass
 
-    print("  Your Python installation can't verify HTTPS certificates (common after installing "
-          "Python from python.org on macOS). Falling back to an unverified connection for this "
-          "one download only -- it's a fixed, public model file. To fix it properly: "
-          "`pip3 install certifi`, or run \"Install Certificates.command\" in your Python folder.")
+    print("  Can't verify HTTPS certificates (common on macOS python.org installs). Falling back "
+          "to an unverified connection for this one public model file. To fix: `pip3 install "
+          "certifi`, or run \"Install Certificates.command\" in your Python folder.")
     ctx = ssl._create_unverified_context()
     with urllib.request.urlopen(url, context=ctx, timeout=60) as resp, open(dest_path, "wb") as f:
         f.write(resp.read())
 
 
 class LandmarkTracker:
+    """Haar face detection + LBF 68-point facemark in one call:
+    image -> (landmarks[68,2], face_box) or (None, None)."""
 
     def __init__(self, model_path: Path = LBF_MODEL_PATH):
         if not hasattr(cv2, "face"):
             raise RuntimeError(
-                "cv2.face is missing -- you have plain opencv-python, but the landmark tracker "
-                "needs opencv-contrib-python. Fix: pip3 uninstall -y opencv-python && "
+                "cv2.face is missing -- you have plain opencv-python, but this needs "
+                "opencv-contrib-python. Fix: pip3 uninstall -y opencv-python && "
                 "pip3 install 'opencv-contrib-python<5'")
         self._cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -66,7 +83,7 @@ class LandmarkTracker:
         faces = self._cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
         if len(faces) == 0:
             return None, None
-        faces = np.array(sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:1])
+        faces = np.array(sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:1])  # largest only
         ok, landmarks = self._fm.fit(gray, faces)
         if not ok:
             return None, None
@@ -74,7 +91,8 @@ class LandmarkTracker:
 
 
 def _skin_mask(bgr: np.ndarray) -> np.ndarray:
-
+    """Binary skin mask in YCrCb (robust across skin tones), used for the
+    hand-gesture zone features."""
     ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
     return ((cr > 135) & (cr < 180) & (cb > 85) & (cb < 135)).astype(np.uint8)
@@ -82,21 +100,31 @@ def _skin_mask(bgr: np.ndarray) -> np.ndarray:
 
 def extract_features(bgr: np.ndarray, landmarks: np.ndarray,
                      face_box: Tuple[int, int, int, int]) -> np.ndarray:
+    """68 landmarks + image -> length-N_FEATURES vector. Geometry features
+    are normalized by interocular distance for scale invariance:
+      geometry (6): mouth gap, mouth width, gap/width, brow raise, eye
+                    openness, smile.
+      mouth color (2): dark-cavity fraction, pink/tongue fraction.
+      hand zones (4): skin coverage below / over-mouth / left / right of
+                    the face (separates huh/shush from face expressions).
+    """
     pts = landmarks
     x, y, w, h = face_box
     H, W = bgr.shape[:2]
-    io = float(np.linalg.norm(pts[36] - pts[45])) + 1e-6
+    io = float(np.linalg.norm(pts[36] - pts[45])) + 1e-6   # interocular distance
     d = lambda a, b: float(np.linalg.norm(pts[a] - pts[b]))
 
     geom = [
-        d(62, 66) / io,
-        d(48, 54) / io,
-        d(62, 66) / (d(48, 54) + 1e-6),
-        (pts[[19, 24], 1].mean() - pts[[37, 44], 1].mean()) / io * -1.0,
-        (d(37, 41) + d(43, 47)) / 2 / io,
-        (pts[[48, 54], 1].mean() - pts[51, 1]) / io,
+        d(62, 66) / io,                                     # inner-lip vertical gap
+        d(48, 54) / io,                                     # mouth width
+        d(62, 66) / (d(48, 54) + 1e-6),                     # openness / width
+        (pts[[19, 24], 1].mean() - pts[[37, 44], 1].mean()) / io * -1.0,  # brow raise
+        (d(37, 41) + d(43, 47)) / 2 / io,                   # eye openness
+        (pts[[48, 54], 1].mean() - pts[51, 1]) / io,        # smile (corners vs top lip)
     ]
 
+    # mouth-interior color ROI, centered on mouth landmarks and sized by
+    # interocular distance rather than the jittery face box
     mc = pts[48:68].mean(0)
     r = 0.55 * io
     rx0, ry0 = int(mc[0] - r), int(mc[1] - 0.4 * io)
@@ -129,10 +157,12 @@ def extract_features(bgr: np.ndarray, landmarks: np.ndarray,
     assert feats.shape[0] == N_FEATURES, f"expected {N_FEATURES} features, got {feats.shape[0]}"
     return feats
 
+
+# --- dataset IO (feature vectors + string labels) ---------------------------
+
 def load_dataset(*paths: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Load and concatenate one or more .npz datasets (each with arrays
-    'X' [n, N_FEATURES] and 'y' [n] of pose strings). Missing files are
-    skipped. Returns (X, y); empty arrays if nothing loads."""
+    """Load and concatenate one or more .npz datasets (arrays 'X'
+    [n, N_FEATURES] and 'y' [n]). Missing files are skipped."""
     Xs, ys = [], []
     for p in paths:
         if p and Path(p).exists():
@@ -147,13 +177,19 @@ def load_dataset(*paths: Path) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def append_samples(path: Path, X_new: np.ndarray, y_new: np.ndarray) -> None:
-
+    """Append feature rows + labels to a dataset, creating it if needed."""
     X_old, y_old = load_dataset(path)
     X = np.vstack([X_old, np.asarray(X_new, np.float32)]) if X_old.size else np.asarray(X_new, np.float32)
     y = np.concatenate([y_old, np.asarray(y_new, str)]) if y_old.size else np.asarray(y_new, str)
     np.savez(path, X=X, y=y)
 
+
+# --- classifier (trained at runtime from the datasets above) ----------------
+
 class ExpressionClassifier:
+    """RandomForest over expression feature vectors. Trained in-process
+    each launch, so there's no pickled model to break across sklearn
+    versions."""
 
     def __init__(self):
         self._clf = None
@@ -179,7 +215,7 @@ class ExpressionClassifier:
         return self._n_train
 
     def predict(self, feats: np.ndarray) -> Tuple[Optional[str], float]:
-
+        """Return (pose, confidence in [0,1]); (None, 0.0) if untrained."""
         if self._clf is None:
             return None, 0.0
         proba = self._clf.predict_proba(feats.reshape(1, -1))[0]
@@ -188,7 +224,7 @@ class ExpressionClassifier:
 
 
 def build_classifier() -> ExpressionClassifier:
-
+    """Load bootstrap + user datasets and train. Raises if there's no data."""
     X, y = load_dataset(BOOTSTRAP_DATASET, USER_DATASET)
     clf = ExpressionClassifier()
     clf.train(X, y)
