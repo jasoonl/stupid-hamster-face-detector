@@ -1,46 +1,18 @@
 """
-make a face -- shows one of your own reference photos ("hamster" faces)
-when your live expression matches it, with a live camera feed + neon-green
-readout on the left and the matched photo on the right.
-
-HOW RECOGNITION WORKS NOW (this is a full rewrite of the old approach):
-
-The previous version compared raw pixels of a mouth crop against each
-reference photo. Tested against real webcam footage, that failed badly
-(~25% -- it literally could not tell a neutral face from a shocked one),
-for two reasons: (1) it located the mouth as a fixed fraction of the
-OpenCV Haar face box, whose height swings wildly frame to frame, so the
-crop landed on the nose or chin; (2) even perfectly aligned, grayscale
-mouth crops don't discriminate expressions -- they all correlate.
-
-This version instead:
-  - tracks 68 facial landmarks with OpenCV's LBF facemark (pure CPU, so
-    it CANNOT trigger the MediaPipe Metal-GPU crash that aborted the old
-    app on macOS -- MediaPipe is gone entirely here),
-  - turns them (+ a mouth-color read + skin coverage around the face for
-    the hand gestures) into a small feature vector,
-  - classifies that vector with a RandomForest trained on real labeled
-    frames. On the reference footage this separated all five expressions
-    (neutral / shock / tongue / huh / shush) at ~94%.
-
-See expression_engine.py for the recognition brain. This file is the
-camera loop, the UI, and the in-app "teach it" data-collection mode.
-
-TEACH IT YOUR FACE (improves accuracy):
-  While it's running, hold an expression and press the number key for it:
-      1 neutral   2 shock   3 tongue   4 huh   5 shush
-  Each press records the current frame as a labeled example and instantly
-  retrains, so it gets better at YOUR face, lighting and camera the more
-  you feed it. Samples are saved (features_user.npz) and reused next run.
+make a face -- shows one of your own reference photos when your live
+expression matches it. Camera feed + neon readout on the left, matched
+photo on the right. Recognition lives in expression_engine.py; this file
+is the camera loop, UI, and the in-app "teach it" data collector.
 
 CONTROLS:
   1..5  record the current frame as neutral/shock/tongue/huh/shush
+        (each press retrains instantly, improving accuracy on your face)
   q     quit
 
 SETUP:
   pip3 uninstall -y opencv-python                 # if you have the plain one
   pip3 install "opencv-contrib-python<5" numpy scikit-learn
-  python3 app.py            # (add a number, e.g. `python3 app.py 1`, for a second camera)
+  python3 app.py            # add a number, e.g. `python3 app.py 1`, for a second camera
 
 Put your photos in an "images" folder next to this script, named for the
 pose: shock.jpg, tongue.jpg (or toungue.jpg), huh.jpg, shush.jpg,
@@ -57,15 +29,11 @@ import numpy as np
 import expression_engine as engine
 
 
-# ----------------------------------------------------------------------------
-# constants
-# ----------------------------------------------------------------------------
-
 WINDOW_NAME = "make a face"
-NEON_GREEN = (20, 255, 57)       # BGR -- the #39FF14 neon-green look from the reference video
-PANEL_BG = (234, 242, 244)       # plain near-white reaction panel, matching the video
+NEON_GREEN = (20, 255, 57)       # BGR
+PANEL_BG = (234, 242, 244)       # near-white reaction panel
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-IDLE_FONT = cv2.FONT_HERSHEY_SCRIPT_SIMPLEX      # soft handwritten look for the idle prompt
+IDLE_FONT = cv2.FONT_HERSHEY_SCRIPT_SIMPLEX      # handwritten look for the idle prompt
 IDLE_TEXT_COLOR = (150, 150, 150)
 
 PANEL_W, PANEL_H = 480, 480      # each side of the combined window
@@ -81,26 +49,15 @@ IMAGE_ALIASES = {
     "huh": ["huh", "shrug"],
 }
 
-# Confidence the classifier must reach before we actually show a pose's
-# photo. Below this we show the idle "make a face" prompt rather than
-# guessing. Tunable; 0.55 rejected the borderline frames in testing while
-# still firing on clear expressions.
-CONFIDENCE_THRESHOLD = 0.55
-# A pose must win this many frames in a row before the shown photo
-# switches -- debounce, so it doesn't flicker between two near-tied poses.
-HOLD_FRAMES = 3
-# "neutral" is a real class the model predicts, but it isn't a photo we
-# pop up as a "reaction" -- when neutral wins, we show the idle prompt.
-IDLE_POSE = "neutral"
+CONFIDENCE_THRESHOLD = 0.55      # below this, show the idle prompt instead of guessing
+HOLD_FRAMES = 3                  # frames a pose must win before the shown photo switches (debounce)
+IDLE_POSE = "neutral"            # predicted, but shows the idle prompt rather than a reaction photo
 
-# number-key -> pose, for the in-app "teach it" data collector
 RECORD_KEYS = {ord("1"): "neutral", ord("2"): "shock", ord("3"): "tongue",
                ord("4"): "huh", ord("5"): "shush"}
 
 
-# ----------------------------------------------------------------------------
-# reference images + UI (ported unchanged from the previous version)
-# ----------------------------------------------------------------------------
+# --- reference images + UI --------------------------------------------------
 
 def fit_image_to_panel(img: Optional[np.ndarray], w: int, h: int) -> np.ndarray:
     """Resize `img` to fit inside a w x h panel, preserving aspect ratio,
@@ -128,10 +85,8 @@ def fit_image_to_panel(img: Optional[np.ndarray], w: int, h: int) -> np.ndarray:
 
 
 def load_reference_images(images_dir: Path) -> Dict[str, np.ndarray]:
-    """Return {pose_name: raw image} for every reference photo found.
-    Stored raw (unfit) so draw_reaction_panel fits exactly once at render
-    time (fitting twice baked a visible letterbox bar into non-square
-    photos in the old version)."""
+    """Return {pose_name: raw image} for every reference photo found. Kept
+    raw so draw_reaction_panel fits exactly once, at render time."""
     display_images: Dict[str, np.ndarray] = {}
     if not images_dir.is_dir():
         return display_images
@@ -168,10 +123,9 @@ def draw_reaction_panel(panel: np.ndarray, image: Optional[np.ndarray]) -> None:
 def draw_debug(frame: np.ndarray, face_box: Optional[Tuple[int, int, int, int]],
                pred: Optional[str], conf: float, stats: Optional[dict],
                sample_counts: Dict[str, int], toast: Optional[str]) -> None:
-    """Left panel overlay, styled like the video: a plain neon-green box,
-    small left-aligned neon lines (expression + confidence + a few real
-    landmark stats), a bottom legend for the teach-it keys, and a brief
-    toast when a sample is recorded."""
+    """Camera-panel overlay: face box, the expression/confidence/stats
+    readout, the teach-it legend + per-pose sample counts, and a toast
+    when a sample is recorded."""
     if face_box is not None:
         x, y, w, h = face_box
         cv2.rectangle(frame, (x, y), (x + w, y + h), NEON_GREEN, 2)
@@ -188,7 +142,6 @@ def draw_debug(frame: np.ndarray, face_box: Optional[Tuple[int, int, int, int]],
     for i, line in enumerate(lines):
         cv2.putText(frame, line, (10, 24 + 22 * i), FONT, 0.55, NEON_GREEN, 1, cv2.LINE_AA)
 
-    # bottom: teach-it legend + how many samples the model has of each pose
     H = frame.shape[0]
     legend = "teach: 1 neutral  2 shock  3 tongue  4 huh  5 shush   (q quit)"
     cv2.putText(frame, legend, (10, H - 34), FONT, 0.44, NEON_GREEN, 1, cv2.LINE_AA)
@@ -202,20 +155,17 @@ def draw_debug(frame: np.ndarray, face_box: Optional[Tuple[int, int, int, int]],
 
 
 def stats_from_features(feats: np.ndarray) -> dict:
-    """Human-readable landmark stats for the readout (real values now,
-    unlike the old broken heuristics). Indices match extract_features()."""
+    """Readout stats pulled from the feature vector (indices match
+    extract_features())."""
     return {"mouth_open": float(feats[2]), "brow_raise": float(feats[3]),
             "eye_open": float(feats[4]), "smile": float(feats[5])}
 
 
-# ----------------------------------------------------------------------------
-# main loop
-# ----------------------------------------------------------------------------
+# --- main loop --------------------------------------------------------------
 
 def main() -> None:
     camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else CAMERA_INDEX
 
-    # --- recognition brain (CPU landmarks + trained classifier) ---
     try:
         tracker = engine.LandmarkTracker()
     except Exception as e:
@@ -281,13 +231,11 @@ def main() -> None:
         if pending_count >= HOLD_FRAMES:
             shown_pose = pending_pose
 
-        # which photo (if any) to show: the matched pose's image, unless
-        # it's neutral / unknown / has no photo -> idle prompt
+        # show the matched pose's photo (neutral/unknown/no photo -> idle prompt)
         show_image = None
         if shown_pose is not None and shown_pose != IDLE_POSE:
             show_image = display_images.get(shown_pose)
 
-        # --- render ---
         cam_panel = cv2.resize(frame, (PANEL_W, PANEL_H))
         scaled_box = None
         if face_box is not None:
