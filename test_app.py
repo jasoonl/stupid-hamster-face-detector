@@ -1,96 +1,173 @@
+"""
+Tests for the camera-independent logic in app.py + expression_engine.py.
+No webcam, GUI, or landmark-model download required -- the landmark
+tracker (which needs the one-time model file) is exercised separately at
+runtime, not here. Run:  python3 test_app.py
+
+Covers: feature extraction (shape + invariance), dataset load/append
+round-trip, the classifier train/predict contract, and the UI helpers
+(panel fitting, reaction panel idle/matched, debug overlay, reference-
+image aliasing).
+"""
+import tempfile
+from pathlib import Path
+
 import numpy as np
+import cv2
+
+import expression_engine as E
 import app
 
 
 def check(name, cond):
-    status = "PASS" if cond else "FAIL"
-    print(f"{status}  {name}")
-    return cond
+    print(f"{'PASS' if cond else 'FAIL'}  {name}")
+    return bool(cond)
+
+
+def synthetic_landmarks():
+    """A plausible, roughly face-shaped set of 68 (x, y) points so
+    extract_features() has something valid to compute on without a real
+    image/model. Values are arbitrary but geometrically sane."""
+    pts = np.zeros((68, 2), dtype=np.float32)
+    # eyes: 36 (left outer) .. 45 (right outer) -- set a real interocular span
+    pts[36] = (200, 300); pts[45] = (360, 300)
+    pts[37] = (215, 292); pts[41] = (215, 308)   # left eye top/bottom
+    pts[43] = (345, 292); pts[47] = (345, 308)   # right eye top/bottom
+    pts[19] = (215, 265); pts[24] = (345, 265)   # brows
+    # mouth: outer 48 (L) / 54 (R), top 51, inner top 62 / inner bottom 66
+    pts[48] = (250, 400); pts[54] = (310, 400)
+    pts[51] = (280, 388)
+    pts[62] = (280, 398); pts[66] = (280, 410)
+    for i in range(48, 68):
+        if np.all(pts[i] == 0):
+            pts[i] = (280, 404)
+    return pts
 
 
 def main():
     results = []
 
-    results.append(check("face cascade loaded", not app.FACE_CASCADE.empty()))
-    results.append(check("eye cascade loaded", not app.EYE_CASCADE.empty()))
-    results.append(check("smile cascade loaded", not app.SMILE_CASCADE.empty()))
+    # --- engine constants ---
+    results.append(check("POSES has the 5 expected expressions",
+                         set(E.POSES) == {"neutral", "shock", "tongue", "huh", "shush"}))
+    results.append(check("N_FEATURES is a positive int", isinstance(E.N_FEATURES, int) and E.N_FEATURES > 0))
 
-    results.append(check("clamp: below range", app.clamp(-1, 0, 1) == 0))
-    results.append(check("clamp: above range", app.clamp(2, 0, 1) == 1))
-    results.append(check("clamp: inside range", app.clamp(0.4, 0, 1) == 0.4))
-    results.append(check("lerp: halfway", app.lerp(0, 10, 0.5) == 5))
-    results.append(check("lerp: t=0 returns a", app.lerp(3, 9, 0) == 3))
-    results.append(check("lerp: t=1 returns b", app.lerp(3, 9, 1) == 9))
-  
-    flat = np.array([50, 50, 50, 50, 50], dtype=float)
-    results.append(check("dip width: flat profile has some width", app._contiguous_dip_width(flat) >= 1))
+    # --- extract_features: shape + scale invariance ---
+    img = np.full((480, 640, 3), (150, 130, 180), dtype=np.uint8)
+    lm = synthetic_landmarks()
+    box = (180, 240, 200, 200)
+    feats = E.extract_features(img, lm, box)
+    results.append(check(f"extract_features returns N_FEATURES ({E.N_FEATURES}) floats",
+                         feats.shape == (E.N_FEATURES,) and feats.dtype == np.float32))
 
-    narrow_dip = np.array([50, 50, 10, 50, 50], dtype=float)
-    wide_dip = np.array([50, 20, 10, 20, 50], dtype=float)
-    w_narrow = app._contiguous_dip_width(narrow_dip)
-    w_wide = app._contiguous_dip_width(wide_dip)
-    results.append(check(f"dip width: wider dip measured wider ({w_narrow} -> {w_wide})", w_wide > w_narrow))
+    # scaling the whole face 2x (landmarks + box) should barely change the
+    # geometry features, since they're normalized by interocular distance
+    feats_2x = E.extract_features(img, lm * 2, tuple(v * 2 for v in box))
+    geo = slice(0, 6)
+    results.append(check("geometry features are ~scale-invariant (2x face -> ~same values)",
+                         np.allclose(feats[geo], feats_2x[geo], atol=0.05)))
 
-    off_center = np.array([50, 50, 50, 10, 50, 50, 50], dtype=float)
-    results.append(check("dip width: off-center dip still found narrow",
-                          app._contiguous_dip_width(off_center) <= 3))
+    # --- dataset load/append round-trip ---
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = Path(tmp) / "user.npz"
+        Xa = np.random.RandomState(0).rand(3, E.N_FEATURES).astype(np.float32)
+        E.append_samples(ds, Xa, np.array(["shock", "shock", "tongue"]))
+        E.append_samples(ds, feats.reshape(1, -1), np.array(["neutral"]))
+        X, y = E.load_dataset(ds)
+        results.append(check("append_samples + load_dataset accumulate rows across calls",
+                             X.shape == (4, E.N_FEATURES) and list(y) == ["shock", "shock", "tongue", "neutral"]))
+        results.append(check("load_dataset on a missing path returns empty, no crash",
+                             E.load_dataset(Path(tmp) / "nope.npz")[0].shape == (0, E.N_FEATURES)))
 
-    baseline = app.Baseline(eye_score=1.0, brow_row_frac=0.5, mouth_h=5.0)
-    box = (0, 0, 100, 100)
-
-    neutral_raw = {"eye_score": 1.0, "brow_row_frac": 0.5, "mouth_h": 5.0, "mouth_box_h": 30, "smile": 0.0}
-    obs = app.to_observation(neutral_raw, baseline, box)
-    results.append(check("observation: neutral-vs-own-baseline is all near zero/high-open",
-                          obs.eye_open > 0.9 and obs.brow_raise < 0.05 and obs.mouth_open < 0.05 and obs.smile < 0.05))
-
-    open_mouth_raw = dict(neutral_raw, mouth_h=16.0)
-    obs2 = app.to_observation(open_mouth_raw, baseline, box)
-    results.append(check("observation: taller mouth dip -> higher mouth_open", obs2.mouth_open > obs.mouth_open))
-
-    raised_brow_raw = dict(neutral_raw, brow_row_frac=0.2)
-    obs3 = app.to_observation(raised_brow_raw, baseline, box)
-    results.append(check("observation: brow row moving up -> higher brow_raise", obs3.brow_raise > obs.brow_raise))
-
-    closed_eye_raw = dict(neutral_raw, eye_score=0.1)
-    obs4 = app.to_observation(closed_eye_raw, baseline, box)
-    results.append(check("observation: lower eye score -> lower eye_open", obs4.eye_open < obs.eye_open))
-
-    for o in (obs, obs2, obs3, obs4):
-        for field in ("eye_open", "brow_raise", "mouth_open", "smile"):
-            v = getattr(o, field)
-            if not (0.0 <= v <= 1.0):
-                results.append(check(f"observation: {field} in [0,1] (got {v})", False))
-
-    def obs(eye_open=0.8, brow_raise=0.0, mouth_open=0.0, smile=0.0):
-        return app.Observation(box=(0, 0, 10, 10), eye_open=eye_open, brow_raise=brow_raise,
-                                mouth_open=mouth_open, smile=smile)
-
-    results.append(check("classify: relaxed neutral face -> neutral", app.classify(obs()) == "neutral"))
-    results.append(check("classify: eyes shut -> blink", app.classify(obs(eye_open=0.05)) == "blink"))
-    results.append(check("classify: wide smile -> smile", app.classify(obs(smile=0.8)) == "smile"))
-    results.append(check("classify: open mouth alone -> tongue", app.classify(obs(mouth_open=0.7)) == "tongue"))
-    results.append(check("classify: raised brows + open mouth -> surprised",
-                          app.classify(obs(brow_raise=0.8, mouth_open=0.6)) == "surprised"))
-    results.append(check("classify: closed eyes wins over an incidentally-high smile score",
-                          app.classify(obs(eye_open=0.05, smile=0.9)) == "blink"))
-    results.append(check("classify: every pose name is a real, drawable pose",
-                          all(name in app.POSES for name in
-                              (app.classify(obs()), app.classify(obs(eye_open=0.05)),
-                               app.classify(obs(smile=0.8)), app.classify(obs(mouth_open=0.7)),
-                               app.classify(obs(brow_raise=0.8, mouth_open=0.6))))))
-
-    for name in app.POSES:
-        panel = np.zeros((200, 200, 3), dtype=np.uint8)
-        app.draw_reaction(panel, name)
-        non_bg = np.any(panel != np.array(app.PANEL_BG, dtype=np.uint8))
-        results.append(check(f"pose '{name}' renders and draws something", non_bg))
-
-    panel = np.zeros((200, 200, 3), dtype=np.uint8)
+    # --- classifier train/predict contract ---
     try:
-        app.draw_reaction(panel, "not_a_real_pose")
-        results.append(check("draw_reaction: unknown pose name falls back safely", True))
-    except Exception as e:
-        results.append(check(f"draw_reaction: unknown pose name falls back safely (raised {e!r})", False))
+        from sklearn.ensemble import RandomForestClassifier  # noqa: F401
+        have_sklearn = True
+    except ImportError:
+        have_sklearn = False
+
+    if have_sklearn:
+        rs = np.random.RandomState(1)
+        # two clearly separable clusters -> classifier must recover them
+        Xa = np.vstack([rs.rand(20, E.N_FEATURES), rs.rand(20, E.N_FEATURES) + 5.0]).astype(np.float32)
+        ya = np.array(["neutral"] * 20 + ["shock"] * 20)
+        clf = E.ExpressionClassifier()
+        results.append(check("classifier not ready before training", not clf.ready))
+        clf.train(Xa, ya)
+        results.append(check("classifier ready after training and reports n_train", clf.ready and clf.n_train == 40))
+        pose_lo, conf_lo = clf.predict(np.zeros(E.N_FEATURES, np.float32))
+        pose_hi, conf_hi = clf.predict(np.full(E.N_FEATURES, 5.0, np.float32))
+        results.append(check("classifier separates the two clusters correctly",
+                             pose_lo == "neutral" and pose_hi == "shock"))
+        results.append(check("classifier confidence is a probability in [0,1]",
+                             0.0 <= conf_lo <= 1.0 and 0.0 <= conf_hi <= 1.0))
+        # untrained classifier returns (None, 0.0), never crashes
+        results.append(check("untrained classifier predict -> (None, 0.0)",
+                             E.ExpressionClassifier().predict(feats) == (None, 0.0)))
+        # training refuses degenerate input
+        try:
+            E.ExpressionClassifier().train(Xa[:1], ya[:1]); ok = False
+        except ValueError:
+            ok = True
+        results.append(check("train refuses <2 samples / <2 classes", ok))
+    else:
+        print("SKIP  classifier tests (scikit-learn not installed)")
+
+    # --- UI: fit_image_to_panel ---
+    solid = lambda w, h, c: np.full((h, w, 3), c, dtype=np.uint8)
+    out = app.fit_image_to_panel(solid(200, 200, (10, 10, 200)), 400, 250)
+    results.append(check("fit_image_to_panel: square into wide panel is padded with PANEL_BG",
+                         tuple(int(v) for v in out[125, 5]) == app.PANEL_BG and
+                         tuple(int(v) for v in out[125, 200]) == (10, 10, 200)))
+    results.append(check("fit_image_to_panel: None returns a plain panel, no crash",
+                         app.fit_image_to_panel(None, 100, 100).shape == (100, 100, 3)))
+    # alpha compositing blends toward the background
+    rgba = np.dstack([solid(200, 200, (10, 10, 200)), np.full((200, 200), 128, np.uint8)])
+    center = tuple(int(v) for v in app.fit_image_to_panel(rgba, 300, 300)[150, 150])
+    results.append(check("fit_image_to_panel: 50% alpha blends toward background",
+                         center != (10, 10, 200) and center != app.PANEL_BG))
+
+    # --- UI: reaction panel idle vs matched ---
+    idle = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
+    app.draw_reaction_panel(idle, None)
+    results.append(check("reaction panel idle: plain PANEL_BG background",
+                         tuple(int(v) for v in idle[5, 5]) == app.PANEL_BG))
+    results.append(check("reaction panel idle: 'make a face' text drawn in muted gray, not neon",
+                         np.any(np.all(idle == np.array(app.IDLE_TEXT_COLOR, np.uint8), axis=-1)) and
+                         not np.any(np.all(idle == np.array(app.NEON_GREEN, np.uint8), axis=-1))))
+    matched = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
+    app.draw_reaction_panel(matched, solid(100, 300, (200, 100, 50)))
+    results.append(check("reaction panel matched: the photo's own color appears",
+                         np.any(np.all(matched == np.array((200, 100, 50), np.uint8), axis=-1))))
+
+    # --- UI: debug overlay draws in neon green, no crash, with/without face ---
+    frame = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
+    app.draw_debug(frame, (50, 50, 100, 100), "shock", 0.87,
+                   {"mouth_open": 0.3, "brow_raise": 0.1, "eye_open": 0.2, "smile": 0.0},
+                   {"neutral": 5, "shock": 3, "tongue": 4, "huh": 2, "shush": 6}, "recorded shock")
+    results.append(check("draw_debug: draws neon-green overlay when a face is present",
+                         np.any(np.all(frame == np.array(app.NEON_GREEN, np.uint8), axis=-1))))
+    frame2 = np.zeros((app.PANEL_H, app.PANEL_W, 3), np.uint8)
+    app.draw_debug(frame2, None, None, 0.0, None, {}, None)
+    results.append(check("draw_debug: handles no-face / no-stats without crashing",
+                         frame2.shape == (app.PANEL_H, app.PANEL_W, 3)))
+
+    # --- stats_from_features maps to a readable dict ---
+    s = app.stats_from_features(feats)
+    results.append(check("stats_from_features returns the 4 readout keys",
+                         set(s.keys()) == {"mouth_open", "brow_raise", "eye_open", "smile"}))
+
+    # --- load_reference_images with aliasing ---
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        cv2.imwrite(str(d / "shock.jpg"), solid(60, 60, (0, 0, 255)))
+        cv2.imwrite(str(d / "toungue.png"), solid(60, 60, (0, 255, 0)))   # misspelling alias
+        imgs = app.load_reference_images(d)
+        results.append(check("load_reference_images: finds shock.jpg", "shock" in imgs))
+        results.append(check("load_reference_images: matches 'toungue' misspelling to tongue", "tongue" in imgs))
+        results.append(check("load_reference_images: absent poses simply missing", "huh" not in imgs))
+        results.append(check("load_reference_images: missing dir -> empty dict, no crash",
+                             app.load_reference_images(d / "nope") == {}))
 
     print()
     passed, total = sum(results), len(results)
@@ -101,4 +178,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
