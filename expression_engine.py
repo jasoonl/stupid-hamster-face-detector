@@ -66,7 +66,6 @@ class LandmarkTracker:
         faces = self._cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
         if len(faces) == 0:
             return None, None
-        # largest face only
         faces = np.array(sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:1])
         ok, landmarks = self._fm.fit(gray, faces)
         if not ok:
@@ -86,16 +85,16 @@ def extract_features(bgr: np.ndarray, landmarks: np.ndarray,
     pts = landmarks
     x, y, w, h = face_box
     H, W = bgr.shape[:2]
-    io = float(np.linalg.norm(pts[36] - pts[45])) + 1e-6   # interocular distance
+    io = float(np.linalg.norm(pts[36] - pts[45])) + 1e-6
     d = lambda a, b: float(np.linalg.norm(pts[a] - pts[b]))
 
     geom = [
-        d(62, 66) / io,                                     # inner-lip vertical gap (openness)
-        d(48, 54) / io,                                     # mouth width
-        d(62, 66) / (d(48, 54) + 1e-6),                     # openness relative to width
-        (pts[[19, 24], 1].mean() - pts[[37, 44], 1].mean()) / io * -1.0,  # brow raise
-        (d(37, 41) + d(43, 47)) / 2 / io,                   # eye openness
-        (pts[[48, 54], 1].mean() - pts[51, 1]) / io,        # mouth corners vs top lip (smile)
+        d(62, 66) / io,
+        d(48, 54) / io,
+        d(62, 66) / (d(48, 54) + 1e-6),
+        (pts[[19, 24], 1].mean() - pts[[37, 44], 1].mean()) / io * -1.0,
+        (d(37, 41) + d(43, 47)) / 2 / io,
+        (pts[[48, 54], 1].mean() - pts[51, 1]) / io,
     ]
 
     mc = pts[48:68].mean(0)
